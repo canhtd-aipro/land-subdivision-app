@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState, useEffect } from "react";
+import React, { useRef, useState, useEffect } from "react";
 
 /**
  * Land Subdivision Web App (single-file React component)
@@ -70,7 +70,7 @@ function dist2(a, b) {
   return dx * dx + dy * dy;
 }
 
-function snapToPools(p, pools, tolPx) {
+function snapToPools(p, pools, tolUnits) {
   // pools: array of arrays of points [[x,y], ...]
   let best = null;
   let bestD2 = Infinity;
@@ -83,7 +83,7 @@ function snapToPools(p, pools, tolPx) {
       }
     }
   }
-  if (best && Math.sqrt(bestD2) <= tolPx) return best; // snap/merge
+  if (best && Math.sqrt(bestD2) <= tolUnits) return best; // snap/merge
   return p;
 }
 
@@ -122,7 +122,7 @@ function collectSegments(boundary, boundaryClosed, current, internalRoads, lots)
   return segs;
 }
 
-function snapToNearestSegment(p, segments, tolPx) {
+function snapToNearestSegment(p, segments, tolUnits) {
   if (!segments || !segments.length) return null;
   let best = null;
   let bestD2 = Infinity;
@@ -133,7 +133,7 @@ function snapToNearestSegment(p, segments, tolPx) {
       best = info;
     }
   }
-  if (best && Math.sqrt(best.d2) <= tolPx) return best.proj;
+  if (best && Math.sqrt(best.d2) <= tolUnits) return best.proj;
   return null;
 }
 
@@ -189,6 +189,126 @@ function scalePolygonToArea(poly, targetArea) {
   return poly.map(pt => transformPoint(pt, s, cx, cy));
 }
 
+// ---------- Frontage helpers (pure) ----------
+function orient(a, b, c) {
+  const v1x = b[0] - a[0], v1y = b[1] - a[1];
+  const v2x = c[0] - a[0], v2y = c[1] - a[1];
+  const cross = v1x * v2y - v1y * v2x;
+  return Math.abs(cross) < 1e-9 ? 0 : (cross > 0 ? 1 : -1);
+}
+function onSegment(a, b, p) {
+  const minx = Math.min(a[0], b[0]) - 1e-9, maxx = Math.max(a[0], b[0]) + 1e-9;
+  const miny = Math.min(a[1], b[1]) - 1e-9, maxy = Math.max(a[1], b[1]) + 1e-9;
+  if (p[0] < minx || p[0] > maxx || p[1] < miny || p[1] > maxy) return false;
+  return Math.abs((b[0]-a[0])*(p[1]-a[1]) - (b[1]-a[1])*(p[0]-a[0])) < 1e-9;
+}
+function segmentsIntersectOrTouch(a, b, c, d) {
+  const o1 = orient(a, b, c);
+  const o2 = orient(a, b, d);
+  const o3 = orient(c, d, a);
+  const o4 = orient(c, d, b);
+  if (o1 !== o2 && o3 !== o4) return true; // proper intersection
+  if (o1 === 0 && onSegment(a, b, c)) return true;
+  if (o2 === 0 && onSegment(a, b, d)) return true;
+  if (o3 === 0 && onSegment(c, d, a)) return true;
+  if (o4 === 0 && onSegment(c, d, b)) return true;
+  return false;
+}
+function edgesFromPolygon(poly, closed=true) {
+  const segs = [];
+  if (!poly || poly.length < 2) return segs;
+  for (let i=0;i<poly.length-1;i++) segs.push([poly[i], poly[i+1]]);
+  if (closed && poly.length>=3) segs.push([poly[poly.length-1], poly[0]]);
+  return segs;
+}
+function pathSegsBetweenIndices(boundary, iFrom, iTo) {
+  const segs=[]; let i=iFrom;
+  while (i !== iTo) {
+    const j = (i+1) % boundary.length;
+    segs.push([boundary[i], boundary[j]]);
+    i = j;
+  }
+  return segs;
+}
+function nearestBoundaryIndex(pt, boundary) {
+  let bestI = -1, bestD = Infinity;
+  for (let i=0;i<boundary.length;i++) {
+    const d = distance(pt, boundary[i]);
+    if (d < bestD) { bestD = d; bestI = i; }
+  }
+  return bestI;
+}
+function segmentDistance(a, b, c, d) {
+  const d1 = pointSegProjection(a, c, d).d2;
+  const d2 = pointSegProjection(b, c, d).d2;
+  const d3 = pointSegProjection(c, a, b).d2;
+  const d4 = pointSegProjection(d, a, b).d2;
+  return Math.sqrt(Math.min(d1, d2, d3, d4));
+}
+function polyMinDistance(polyA, polyB) {
+  if (!polyA || !polyB || polyA.length < 2 || polyB.length < 2) return Infinity;
+  let best = Infinity;
+  const nA = polyA.length, nB = polyB.length;
+  for (let i = 0; i < nA; i++) {
+    const a1 = polyA[i], a2 = polyA[(i + 1) % nA];
+    for (let j = 0; j < nB; j++) {
+      const b1 = polyB[j], b2 = polyB[(j + 1) % nB];
+      const d = segmentDistance(a1, a2, b1, b2);
+      if (d < best) best = d;
+    }
+  }
+  return best;
+}
+/**
+ * Compute which road a lot fronts.
+ * Priority: internal roads > public road segment along boundary between the first two public entry points.
+ * If there's no intersection/touch, use distance threshold `tolUnits` to consider as touching.
+ * @param {number[][]} lotPoly
+ * @param {object} ctx - { boundary, boundaryClosed, publicEntryPoints, internalRoads }
+ * @param {number} tolUnits - tolerance in SVG units (use ~3px converted by caller)
+ * @returns {string|null}
+ */
+function computeFrontRoadForLot(lotPoly, ctx, tolUnits = 0) {
+  const { boundary, boundaryClosed, publicEntryPoints, internalRoads } = ctx || {};
+  if (!lotPoly || lotPoly.length < 3) return null;
+  const lotEdges = edgesFromPolygon(lotPoly, true);
+
+  // 1) Internal roads first: intersect/touch or within tolUnits
+  if (Array.isArray(internalRoads)) {
+    for (const r of internalRoads) {
+      const roadEdges = edgesFromPolygon(r.polygon, true);
+      let touch = false;
+      for (const [a,b] of lotEdges) {
+        for (const [c,d] of roadEdges) {
+          if (segmentsIntersectOrTouch(a,b,c,d)) { touch = true; break; }
+          if (tolUnits > 0 && segmentDistance(a,b,c,d) <= tolUnits) { touch = true; break; }
+        }
+        if (touch) break;
+      }
+      if (touch) return r.road_id;
+    }
+  }
+
+  // 2) Public boundary segment (between first two entry points) if available
+  if (boundaryClosed && Array.isArray(boundary) && boundary.length>=3 && Array.isArray(publicEntryPoints) && publicEntryPoints.length>=2) {
+    const iA = nearestBoundaryIndex(publicEntryPoints[0], boundary);
+    const iB = nearestBoundaryIndex(publicEntryPoints[1], boundary);
+    if (iA !== -1 && iB !== -1 && iA !== iB) {
+      const segsAB = pathSegsBetweenIndices(boundary, iA, iB);
+      const segsBA = pathSegsBetweenIndices(boundary, iB, iA);
+      const len = (ss)=>ss.reduce((s,[[x1,y1],[x2,y2]])=>s+Math.hypot(x2-x1,y2-y1),0);
+      const pubSegs = len(segsAB) <= len(segsBA) ? segsAB : segsBA;
+      for (const [a,b] of lotEdges) {
+        for (const [c,d] of pubSegs) {
+          if (segmentsIntersectOrTouch(a,b,c,d)) return "R003";
+          if (tolUnits > 0 && segmentDistance(a,b,c,d) <= tolUnits) return "R003";
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // ---------- Main Component ----------
 export default function LandSubdivisionApp() {
   const [landId, setLandId] = useState("L001");
@@ -213,8 +333,25 @@ export default function LandSubdivisionApp() {
   const [lots, setLots] = useState([]); // [{lot_id, polygon:[[x,y]], front_road}]
 
   // Snap tolerance (pixels on canvas)
-  const [snapTol, setSnapTol] = useState(2);
-  const [lineTol, setLineTol] = useState(2);
+  const [snapTol, setSnapTol] = useState(4);
+  const [lineTol, setLineTol] = useState(4);
+
+  // --- Grid snap ---
+  const [gridSnap, setGridSnap] = useState(true);
+  const [gridStep, setGridStep] = useState(2);   // kích thước ô lưới (đơn vị SVG, ví dụ: mét)
+  const [gridTol, setGridTol] = useState(8);      // bán kính hút theo px
+  const [gridStrict, setGridStrict] = useState(false); // bật = luôn dính lưới
+  const [gridOrigin, setGridOrigin] = useState({ x: 0, y: 0 }); // gốc lưới
+
+  function snapToGrid(p, step, origin, tolUnits, always=false) {
+    if (!step || step <= 0) return p;
+    const gx = Math.round((p[0] - origin.x) / step) * step + origin.x;
+    const gy = Math.round((p[1] - origin.y) / step) * step + origin.y;
+    const g = [Number(gx.toFixed(2)), Number(gy.toFixed(2))];
+    if (always) return g;
+    return distance(p, g) <= tolUnits ? g : p;
+  }
+
 
   // --- Global scale / area controls ---
   const [scalePct, setScalePct] = useState(100);
@@ -226,11 +363,11 @@ export default function LandSubdivisionApp() {
   // --- Auto-scale new shapes ---
   const [autoScaleNew, setAutoScaleNew] = useState(false);
   const [autoTargetArea, setAutoTargetArea] = useState(200); // m²
-  const [autoApplyTo, setAutoApplyTo] = useState({ lot: false, boundary: true, internalRoad: false });
+  const [autoApplyTo, setAutoApplyTo] = useState({ lot: false, boundary: false, internalRoad: false });
 
   // --- ViewBox-based zoom/pan ---
   const canvasW = 1000, canvasH = 640;
-  const ZOOM_BASE = 5; // 100% equals 5x magnification
+  const ZOOM_BASE = 8; // 100% equals 5x magnification
   const baseView = { x: 0, y: 0, w: canvasW / ZOOM_BASE, h: canvasH / ZOOM_BASE };
   const [viewBox, setViewBox] = useState(baseView);
   const zoomPercent = Math.round((canvasW / viewBox.w) * (100 / ZOOM_BASE));
@@ -273,15 +410,8 @@ export default function LandSubdivisionApp() {
   const DY_LABEL = 8 * unitsPerPx.y;   // ~8px up
 
   // Helpers to create incremental IDs
-  const nextRoadId = useMemo(() => {
-    const idx = internalRoads.length + 1;
-    return (n = idx) => `R${String(n).padStart(3, "0")}`;
-  }, [internalRoads.length]);
-
-  const nextLotId = useMemo(() => {
-    const idx = lots.length + 1;
-    return (n = idx) => `${landId}-${String(n).padStart(2, "0")}`;
-  }, [lots.length, landId]);
+  const nextRoadId = () => `R${String(internalRoads.length + 1).padStart(3, "0")}`;
+  const nextLotId  = () => `${landId}-${String(lots.length + 1).padStart(2, "0")}`;
 
   // --------- Scale/Area helpers ---------
   function getAnchor() {
@@ -316,7 +446,7 @@ export default function LandSubdivisionApp() {
     applyScaleFactor(s);
   }
 
-  const boundaryArea = useMemo(() => (boundary.length >= 3 ? shoelaceArea(boundary) : 0), [boundary]);
+  const boundaryArea = boundary.length >= 3 ? shoelaceArea(boundary) : 0;
 
   function onScaleToArea() {
     if (boundaryArea <= 0) return;
@@ -358,16 +488,7 @@ export default function LandSubdivisionApp() {
     });
   }
 
-  function onWheel(e) {
-    e.preventDefault();
-    const svg = svgRef.current;
-    if (!svg) return;
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX; pt.y = e.clientY;
-    const { x, y } = pt.matrixTransform(svg.getScreenCTM().inverse());
-    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1; // up: zoom in, down: zoom out
-    zoomAt(x, y, factor);
-  }
+  function resetView() { setViewBox(baseView); }
 
   function getAllPoints() {
     return [
@@ -381,7 +502,7 @@ export default function LandSubdivisionApp() {
 
   function fitView() {
     const pts = getAllPoints();
-    if (!pts.length) { setViewBox({ x: 0, y: 0, w: canvasW, h: canvasH }); return; }
+    if (!pts.length) { resetView(); return; }
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const [x, y] of pts) { if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y; }
     const w = Math.max(1, maxX - minX);
@@ -390,8 +511,6 @@ export default function LandSubdivisionApp() {
     const mw = w * margin, mh = h * margin;
     setViewBox({ x: minX - mw, y: minY - mh, w: w + 2 * mw, h: h + 2 * mh });
   }
-
-  function resetView() { setViewBox({ x: 0, y: 0, w: canvasW / ZOOM_BASE, h: canvasH / ZOOM_BASE }); }
 
   // -------------- Pointer → SVG coords --------------
   function clientToSvg(e) {
@@ -404,38 +523,47 @@ export default function LandSubdivisionApp() {
   }
 
   function computePreviewPoint(e) {
-    const raw0 = clientToSvg(e);
-    if (!raw0) return null;
+  const raw0 = clientToSvg(e);
+  if (!raw0) return null;
 
-    let raw = raw0;
-    // Axis-lock if Shift held relative to prev fixed point in current drawing mode
-    let prev = null;
-    if (mode === "boundary" && !boundaryClosed && current.length) prev = current[current.length - 1];
-    else if ((mode === "internalRoad" || mode === "lot") && current.length) prev = current[current.length - 1];
-    else if (mode === "publicRoad" && publicEntryPoints.length) prev = publicEntryPoints[publicEntryPoints.length - 1];
-    if (e.shiftKey && prev) raw = axisAlign(prev, raw);
+  // Xác định điểm trước đó để khóa trục nếu giữ Shift
+  let prev = null;
+  if (mode === "boundary" && !boundaryClosed && current.length) prev = current[current.length - 1];
+  else if ((mode === "internalRoad" || mode === "lot") && current.length) prev = current[current.length - 1];
+  else if (mode === "publicRoad" && publicEntryPoints.length) prev = publicEntryPoints[publicEntryPoints.length - 1];
 
-    // Line snap to nearest segment
-    const segments = collectSegments(boundary, boundaryClosed, current, internalRoads, lots);
-    const proj = snapToNearestSegment(raw, segments, lineTol);
-    if (proj) raw = [parseFloat(proj[0].toFixed(2)), parseFloat(proj[1].toFixed(2))];
+  // 1) Khóa trục nếu giữ Shift
+  const aligned = (e.shiftKey && prev) ? axisAlign(prev, raw0) : raw0;
 
-    // Vertex snap/merge pools
-    const pools = [];
-    if (boundary.length) pools.push(boundary);
-    if (publicEntryPoints.length) pools.push(publicEntryPoints);
-    // avoid snapping the hover point back onto the last anchor itself
-    if (current.length) {
-      const poolExceptLast = current.slice(0, -1);
-      if (poolExceptLast.length) pools.push(poolExceptLast);
+  // 2) Snap vào GRID (theo px → đơn vị SVG)
+  const tolUnitsGrid = gridTol * __avgUP;
+  let p1 = gridSnap ? snapToGrid(aligned, gridStep, gridOrigin, tolUnitsGrid, gridStrict) : aligned;
+
+  // 3) Snap vào LINE (chọn cái nào gần con trỏ hơn: grid hay line)
+  const segments = collectSegments(boundary, boundaryClosed, current, internalRoads, lots);
+  let p2 = p1;
+  if (segments && segments.length) {
+    const proj = snapToNearestSegment(aligned, segments, lineTol * __avgUP);
+    if (proj) {
+      const dGrid = distance(aligned, p1);
+      const dLine = distance(aligned, proj);
+      p2 = dLine <= dGrid ? [Number(proj[0].toFixed(2)), Number(proj[1].toFixed(2))] : p1;
     }
-    for (const r of internalRoads) pools.push(r.polygon);
-    for (const l of lots) pools.push(l.polygon);
-
-    return snapToPools(raw, pools, snapTol);
   }
 
-  // Click / Move handlers on SVG canvas
+  // 4) Snap/Merge vào VERTEX (nếu trong tolerance)
+  const pools = [];
+  if (boundary.length) pools.push(boundary);
+  if (publicEntryPoints.length) pools.push(publicEntryPoints);
+  if (current.length) {
+    const poolExceptLast = current.slice(0, -1);
+    if (poolExceptLast.length) pools.push(poolExceptLast);
+  }
+  for (const r of internalRoads) pools.push(r.polygon);
+  for (const l of lots) pools.push(l.polygon);
+
+  return snapToPools(p2, pools, snapTol * __avgUP);}
+
   function onCanvasClick(e) {
     const p = computePreviewPoint(e);
     if (!p) return;
@@ -444,8 +572,15 @@ export default function LandSubdivisionApp() {
       if (boundaryClosed) return;
       setCurrent((cur) => dedupPush(cur, p));
     } else if (mode === "publicRoad") {
+      // Project onto boundary if close to it so entry point stays on boundary
+      let point = p;
+      if (boundaryClosed && boundary.length >= 2) {
+        const segs = collectSegments(boundary, true, [], [], []);
+        const proj = snapToNearestSegment(p, segs, lineTol * __avgUP);
+        if (proj) point = proj;
+      }
       setPublicEntryPoints((list) => {
-        const snapped = snapToPools(p, [boundary, list], snapTol);
+        const snapped = snapToPools(point, [boundary, list], snapTol * __avgUP);
         if (list.some((q) => Math.sqrt(dist2(q, snapped)) <= 1e-6)) return list; // de-dup
         return [...list, snapped];
       });
@@ -485,8 +620,8 @@ export default function LandSubdivisionApp() {
       let poly = current;
       if (autoScaleNew && autoApplyTo.lot) poly = scalePolygonToArea(poly, Number(autoTargetArea));
       const id = nextLotId();
-      const front = internalRoads.length ? internalRoads[0].road_id : null; // naive default
-      setLots((ls) => [...ls, { lot_id: id, polygon: poly, front_road: front }]);
+      // front_road is computed on demand during export or panel rendering
+      setLots((ls) => [...ls, { lot_id: id, polygon: poly, front_road: null }]);
       setCurrent([]);
       setHover(null);
     }
@@ -588,46 +723,75 @@ export default function LandSubdivisionApp() {
   }
 
   // Export JSON in requested schema
-  function exportJSON() {
-    const boundaryClosedLoop = boundaryClosed && boundary.length >= 3 ? [...boundary, boundary[0]] : boundary;
+function exportJSON() {
+  const boundaryClosedLoop =
+    boundaryClosed && boundary.length >= 3 ? [...boundary, boundary[0]] : boundary;
 
-    const out = {
-      input: {
-        land_id: landId,
-        boundary: boundaryClosedLoop,
-        roads: [
-          {
-            road_id: "R003", // fixed id for public road similar to your sample
-            is_public: true,
-            width: Number(publicRoadWidth),
-            entry_points: publicEntryPoints,
-            connected_to_public_road: null,
-            road_to_lot_mapping: [],
-          },
-        ],
-      },
-      output: {
-        internal_roads: internalRoads.map((r) => ({
-          road_id: r.road_id,
-          polygon: r.polygon,
-          is_public: false,
-          width: Number(r.width ?? internalWidthDefault),
-          connected_to_public_road: true,
-          road_to_lot_mapping: [],
-        })),
-        lots: lots.map((l, idx) => ({
-          lot_id: l.lot_id ?? `${landId}-${String(idx + 1).padStart(2, "0")}`,
-          polygon: l.polygon,
-          area: Number(shoelaceArea(l.polygon).toFixed(1)),
-          front_road: l.front_road ?? (internalRoads[0]?.road_id || null),
-        })),
-      },
+  const ctx = { boundary, boundaryClosed, publicEntryPoints, internalRoads };
+  const tolUnits = 3 * __avgUP; // ~3px tolerance in SVG units
+
+  // 1) Chuẩn hoá lot_id và tính front_road 1 lần
+  const lotInfos = lots.map((l, idx) => {
+    const id = l.lot_id ?? `${landId}-${String(idx + 1).padStart(2, "0")}`;
+    const poly = l.polygon;
+    const area = Number(shoelaceArea(poly).toFixed(1));
+    const front = computeFrontRoadForLot(poly, ctx, tolUnits) ?? null;
+    return { id, polygon: poly, area, front };
+  });
+
+  // 2) Gom mapping cho public road ("R003")
+  const publicLotIds = lotInfos
+    .filter(li => li.front === "R003")
+    .map(li => li.id);
+
+  // 3) Gom mapping cho từng internal road
+  const internalRoadsOut = internalRoads.map(r => {
+    const lotIds = lotInfos
+      .filter(li => li.front === r.road_id)
+      .map(li => li.id);
+    return {
+      road_id: r.road_id,
+      polygon: r.polygon,
+      is_public: false,
+      width: Number(r.width ?? internalWidthDefault),
+      connected_to_public_road: true,
+      // >>> mảng chuỗi lot_id
+      road_to_lot_mapping: lotIds,
     };
+  });
 
-    download(`${landId}_subdivision.json`, JSON.stringify(out, null, 2));
-    // also export a PNG snapshot of the drawing
-    exportPNG();
-  }
+  const out = {
+    input: {
+      land_id: landId,
+      boundary: boundaryClosedLoop,
+      roads: [
+        {
+          road_id: "R003", // public road cố định như sample
+          is_public: true,
+          width: Number(publicRoadWidth),
+          entry_points: publicEntryPoints,
+          connected_to_public_road: null,
+          // >>> mảng chuỗi lot_id
+          road_to_lot_mapping: publicLotIds,
+        },
+      ],
+    },
+    output: {
+      internal_roads: internalRoadsOut,
+      lots: lotInfos.map(li => ({
+        lot_id: li.id,
+        polygon: li.polygon,
+        area: li.area,
+        front_road: li.front,
+      })),
+    },
+  };
+
+  download(`${landId}_subdivision.json`, JSON.stringify(out, null, 2));
+  // cũng xuất PNG snapshot
+  exportPNG();
+}
+
 
   // -------------- Render --------------
   // For live length label
@@ -691,12 +855,51 @@ export default function LandSubdivisionApp() {
             <input type="number" value={lineTol} onChange={(e) => setLineTol(Number(e.target.value) || 0)} className="border rounded px-1.5 py-0.5 h-7 text-xs w-14" />
           </div>
 
+          <div className="flex items-center gap-2">
+  <label className="flex items-center gap-1">
+    <input type="checkbox" checked={gridSnap} onChange={e=>setGridSnap(e.target.checked)} />
+    Grid snap
+  </label>
+</div>
+
+<div className="flex items-center gap-2">
+  <span className="text-xs">Grid step</span>
+  <input
+    type="number"
+    value={gridStep}
+    onChange={e=>setGridStep(Number(e.target.value) || 1)}
+    className="border rounded px-1.5 py-0.5 h-7 text-xs w-16"
+  />
+</div>
+
+<div className="flex items-center gap-2">
+  <span className="text-xs">Grid tol (px)</span>
+  <input
+    type="number"
+    value={gridTol}
+    onChange={e=>setGridTol(Number(e.target.value) || 0)}
+    className="border rounded px-1.5 py-0.5 h-7 text-xs w-16"
+  />
+</div>
+
+<div className="flex items-center gap-2">
+  <label className="flex items-center gap-1">
+    <input type="checkbox" checked={gridStrict} onChange={e=>setGridStrict(e.target.checked)} />
+    Always to grid
+  </label>
+</div>
+
+
           {/* Zoom controls */}
           <div className="flex items-center gap-2">
             <span className="text-xs">Zoom</span>
             <button onClick={zoomOutCenter} className="px-1.5 py-0.5 text-xs rounded bg-gray-200 hover:bg-gray-300">-</button>
             <div className="w-12 text-center text-xs">{zoomPercent}%</div>
-            <button onClick={zoomInCenter} className="px-1.5 py-0.5 text-xs rounded bg-gray-200 hover:bg-gray-300">+</button>
+            <button onClick={() => {
+              const svg = svgRef.current; if (!svg) return; const rect = svg.getBoundingClientRect();
+              const cx = viewBox.x + viewBox.w/2; const cy = viewBox.y + viewBox.h/2;
+              zoomAt(cx, cy, 1.2);
+            }} className="px-1.5 py-0.5 text-xs rounded bg-gray-200 hover:bg-gray-300">+</button>
             <button onClick={fitView} className="px-1.5 py-0.5 text-xs rounded bg-gray-200 hover:bg-gray-300">Fit</button>
             <button onClick={resetView} className="px-1.5 py-0.5 text-xs rounded bg-gray-200 hover:bg-gray-300">Reset</button>
           </div>
@@ -752,14 +955,44 @@ export default function LandSubdivisionApp() {
         </div>
 
         <div className="rounded-2xl overflow-hidden bg-white shadow">
-          <svg ref={svgRef} onClick={onCanvasClick} onWheel={onWheel} onMouseMove={onMouseMove} onMouseLeave={onMouseLeave} viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`} className="block mx-auto w-full h-[60vh] md:h-[70vh] xl:h-[78vh] 2xl:h-[82vh] cursor-crosshair">
+          <svg
+            ref={svgRef}
+            onClick={onCanvasClick}
+            onWheel={(e)=>{ e.preventDefault(); const svg = svgRef.current; if (!svg) return; const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY; const { x, y } = pt.matrixTransform(svg.getScreenCTM().inverse()); const factor = e.deltaY < 0 ? 1.1 : 1/1.1; zoomAt(x, y, factor); }}
+            onMouseMove={onMouseMove}
+            onMouseLeave={onMouseLeave}
+            viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`}
+            className="block mx-auto w-full h-[60vh] md:h-[70vh] xl:h-[78vh] 2xl:h-[82vh] cursor-crosshair"
+          >
             {/* Grid */}
             <defs>
-              <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#e5e7eb" strokeWidth="1" vectorEffect="non-scaling-stroke" />
-              </pattern>
-            </defs>
-            <rect width="100%" height="100%" fill="url(#grid)" pointerEvents="none" />
+  {/* Lưới ô nhỏ */}
+  <pattern id="grid" width={gridStep} height={gridStep} patternUnits="userSpaceOnUse">
+    <path
+      d={`M ${gridStep} 0 L 0 0 0 ${gridStep}`}
+      fill="none"
+      stroke="#e5e7eb"
+      strokeWidth="1"
+      vectorEffect="non-scaling-stroke"
+      shapeRendering="crispEdges"
+    />
+  </pattern>
+
+  {/* Lưới ô lớn (mỗi 5 ô nhỏ) cho dễ canh tổng thể */}
+  <pattern id="gridMajor" width={gridStep * 5} height={gridStep * 5} patternUnits="userSpaceOnUse">
+    <path
+      d={`M ${gridStep * 5} 0 L 0 0 0 ${gridStep * 5}`}
+      fill="none"
+      stroke="#cbd5e1"
+      strokeWidth="1.5"
+      vectorEffect="non-scaling-stroke"
+      shapeRendering="crispEdges"
+    />
+  </pattern>
+</defs>
+{/* vẽ phủ 2 lớp lưới */}
+<rect width="2000%" height="2000%" fill="url(#grid)" pointerEvents="none" />
+<rect width="2000%" height="2000%" fill="url(#gridMajor)" pointerEvents="none" />
 
             {/* Boundary */}
             {boundary.length >= 2 && !boundaryClosed && (
@@ -781,7 +1014,7 @@ export default function LandSubdivisionApp() {
             {/* Current drawing path */}
             {current.length >= 2 && (
               <>
-                <polyline points={current.map((p) => p.join(",")).join(" ")} fill="none" stroke="#2563eb" strokeDasharray="6 6" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+                <polyline points={current.map((p) => p.join(",")).join(" ")} fill="none" stroke="#fa0202" strokeDasharray="6 6" strokeWidth="4" vectorEffect="non-scaling-stroke" />
                 <g pointerEvents="none">
                   {segmentsForLabels(current, false).map(([a,b], i) => {
                     const mid = [(a[0]+b[0])/2, (a[1]+b[1])/2];
@@ -812,7 +1045,7 @@ export default function LandSubdivisionApp() {
             {/* Internal roads polygons */}
             {internalRoads.map((r) => (
               <g key={r.road_id}>
-                <polygon points={r.polygon.map((p) => p.join(",")).join(" ")} fill="#f59e0b55" stroke="#b45309" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+                <polygon points={r.polygon.map((p) => p.join(",")).join(" ")} fill="#f59e0b55" stroke="#fadf5a" strokeWidth={2} vectorEffect="non-scaling-stroke" />
                 {r.polygon.length > 0 && (
                   <text x={r.polygon[0][0]} y={r.polygon[0][1]} fontSize={FONT_UNIT} fill="#92400e">{r.road_id}</text>
                 )}
@@ -831,7 +1064,7 @@ export default function LandSubdivisionApp() {
 
             {/* Current points markers */}
             {current.map((p, i) => (
-              <circle key={`c-${i}`} cx={p[0]} cy={p[1]} r={R_POINT} fill="#2563eb" />
+              <circle key={`c-${i}`} cx={p[0]} cy={p[1]} r={R_POINT} fill="#fa0202" />
             ))}
           </svg>
         </div>
@@ -871,11 +1104,15 @@ export default function LandSubdivisionApp() {
           <div className="bg-white rounded-xl shadow p-2">
             <h2 className="text-xs font-semibold mb-1">Lots</h2>
             <ol className="text-xs mt-2 max-h-48 overflow-auto space-y-2">
-              {lots.map((l) => (
-                <li key={l.lot_id}>
-                  <div className="font-medium">{l.lot_id} • area={shoelaceArea(l.polygon).toFixed(1)} • front={l.front_road ?? "-"}</div>
-                </li>
-              ))}
+              {lots.map((l) => {
+                const ctx = { boundary, boundaryClosed, publicEntryPoints, internalRoads };
+                const tolUnits = 3 * __avgUP;
+                return (
+                  <li key={l.lot_id}>
+                    <div className="font-medium">{l.lot_id} • area={shoelaceArea(l.polygon).toFixed(1)} • front={computeFrontRoadForLot(l.polygon, ctx, tolUnits) ?? "-"}</div>
+                  </li>
+                );
+              })}
             </ol>
           </div>
         </section>
@@ -942,7 +1179,20 @@ if (typeof window !== "undefined" && !window.__lsapp_tests_ran__) {
       const tp = transformPoint([3,4], 1, 0, 0);
       console.assert(Math.abs(tp[0]-3)<1e-9 && Math.abs(tp[1]-4)<1e-9, "transformPoint s=1 is identity");
 
-      // NOTE: keep tests light — DOM-dependent functions like exportPNG are not executed here.
+      // === NEW TESTS ===
+      // Front-road selection: internal road touch
+      const lotPoly = [[11,1],[19,1],[19,9],[11,9]]; // right square
+      const roadPoly = [[9,3],[11,3],[11,7],[9,7]];  // touches lot at x=11
+      const ctx1 = { boundary: [[0,0],[20,0],[20,10],[0,10]], boundaryClosed: true, publicEntryPoints: [], internalRoads: [{road_id:"R001", polygon: roadPoly}] };
+      console.assert(computeFrontRoadForLot(lotPoly, ctx1, 0.1) === "R001", "front road = internal R001");
+
+      // Front-road selection: public boundary between EP1 and EP2
+      const boundary2 = [[0,0],[20,0],[20,10],[0,10]];
+      const lot2 = [[2,-1],[6,-1],[6,1],[2,1]]; // touches bottom edge between x=0..20
+      const ctx2 = { boundary: boundary2, boundaryClosed: true, publicEntryPoints: [[0,0],[20,0]], internalRoads: [] };
+      console.assert(computeFrontRoadForLot(lot2, ctx2, 0.5) === "R003", "front road = public R003");
+
+      console.log("All smoke tests passed ✔");
     } catch (e) {
       console.error("Smoke tests failed:", e);
     }
